@@ -107,10 +107,12 @@ with no frontend framework.
 - The **shake detector** samples the cursor position from Core Graphics and
   looks for four direction reversals within 700 ms — a real shake, not a drag or
   jitter.
-- The **overlay window** is a transparent `NSWindow` raised to
-  `NSStatusWindowLevel` with `CanJoinAllSpaces | FullScreenAuxiliary` collection
-  behavior, so it can appear over any Space, including another app's native
-  full-screen mode.
+- The **overlay** is a non-activating `NSPanel` (converted from Tauri's main
+  window via [`tauri-nspanel`](https://github.com/ahkohd/tauri-nspanel)) raised
+  to `NSStatusWindowLevel` with `CanJoinAllSpaces | FullScreenAuxiliary`, so it
+  appears over any Space — including another app's native full-screen mode —
+  without stealing focus or switching Spaces. The panel is clipped to the same
+  corner radius as the UI shell.
 - **Sticky notes** are separate always-on-top windows labelled `pin-<note-id>`
   that sync their body with the main window over Tauri events.
 - **Storage** is the webview's `localStorage`; window size is persisted to

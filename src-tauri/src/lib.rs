@@ -14,6 +14,22 @@ use tauri::{
 };
 use tauri_plugin_autostart::ManagerExt as AutostartManager;
 
+#[cfg(target_os = "macos")]
+use tauri_nspanel::{
+    tauri_panel, CollectionBehavior, ManagerExt as NsPanelManagerExt, PanelLevel, WebviewWindowExt,
+};
+
+#[cfg(target_os = "macos")]
+tauri_panel! {
+    panel!(MotePanel {
+        config: {
+            can_become_key_window: true,
+            can_become_main_window: false,
+            is_floating_panel: true
+        }
+    })
+}
+
 static HIDE_ON_BLUR: AtomicBool = AtomicBool::new(true);
 static HAS_SHOWN: AtomicBool = AtomicBool::new(false);
 static FOCUSED_SINCE_REVEAL: AtomicBool = AtomicBool::new(false);
@@ -188,22 +204,72 @@ pub(crate) fn reveal(app: &AppHandle) {
         return;
     };
     FOCUSED_SINCE_REVEAL.store(false, Ordering::Relaxed);
-    let _ = window.set_visible_on_all_workspaces(true);
-    let _ = window.set_always_on_top(true);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window.set_visible_on_all_workspaces(true);
+        let _ = window.set_always_on_top(true);
+    }
     position_at_cursor(&window);
-    apply_panel_behavior(&window);
     if let Ok(mut last) = LAST_REVEAL.lock() {
         *last = Some(Instant::now());
     }
-    let _ = window.show();
-    let _ = window.set_focus();
+    show_main(app, &window);
     HAS_SHOWN.store(true, Ordering::Relaxed);
     let _ = app.emit("mote://shown", ());
 }
 
+/// Shows the main overlay. On macOS it is an NSPanel, which can join another
+/// app's full-screen Space without activating Mote or switching Spaces.
+#[cfg(target_os = "macos")]
+fn show_main(app: &AppHandle, window: &WebviewWindow) {
+    let app = app.clone();
+    let window = window.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        if let Ok(panel) = app.get_webview_panel("main") {
+            panel.set_level(PanelLevel::Status.value());
+            panel.set_collection_behavior(
+                CollectionBehavior::new()
+                    .can_join_all_spaces()
+                    .full_screen_auxiliary()
+                    .value(),
+            );
+            panel.set_hides_on_deactivate(false);
+            panel.show();
+            panel.make_key_and_order_front();
+        } else {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_main(_app: &AppHandle, window: &WebviewWindow) {
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hide_main(window: &WebviewWindow) {
+    let _ = window.hide();
+}
+
+#[cfg(target_os = "macos")]
+fn hide_main(window: &WebviewWindow) {
+    let app = window.app_handle().clone();
+    let window = window.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        if let Ok(panel) = app.get_webview_panel("main") {
+            panel.hide();
+        } else {
+            let _ = window.hide();
+        }
+    });
+}
+
 fn conceal(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.hide();
+        hide_main(&window);
     }
 }
 
@@ -262,6 +328,42 @@ fn apply_panel_behavior(window: &WebviewWindow) {
 
 #[cfg(not(target_os = "macos"))]
 fn apply_panel_behavior(_window: &WebviewWindow) {}
+
+/// Configures the main overlay NSPanel: joins every Space (including other
+/// apps' full-screen Spaces) and clips to the same radius as the UI shell so
+/// the native glass never shows square corners.
+#[cfg(target_os = "macos")]
+fn configure_panel(panel: &tauri_nspanel::PanelHandle<tauri::Wry>) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::NSWindowStyleMask;
+
+    const CORNER_RADIUS: f64 = 24.0;
+
+    panel.set_level(PanelLevel::Status.value());
+    panel.set_collection_behavior(
+        CollectionBehavior::new()
+            .can_join_all_spaces()
+            .full_screen_auxiliary()
+            .value(),
+    );
+    panel.set_hides_on_deactivate(false);
+    panel.set_floating_panel(true);
+    panel.set_becomes_key_only_if_needed(false);
+    panel.set_has_shadow(false);
+    let mask = panel.as_panel().styleMask() | NSWindowStyleMask::NonactivatingPanel;
+    panel.set_style_mask(mask);
+
+    unsafe {
+        let content = panel.content_view();
+        let _: () = msg_send![&*content, setWantsLayer: true];
+        let layer: *mut AnyObject = msg_send![&*content, layer];
+        if !layer.is_null() {
+            let _: () = msg_send![layer, setCornerRadius: CORNER_RADIUS];
+            let _: () = msg_send![layer, setMasksToBounds: true];
+        }
+    }
+}
 
 fn rounded_rect_distance(
     px: f64,
@@ -415,11 +517,14 @@ fn register_shortcut(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
+    let builder = tauri::Builder::default().plugin(tauri_plugin_autostart::init(
+        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+        None,
+    ));
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_nspanel::init());
+
+    builder
         .invoke_handler(tauri::generate_handler![
             show_window,
             hide_window,
@@ -448,6 +553,14 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
                 window_state::restore(&window);
+
+                #[cfg(target_os = "macos")]
+                match window.to_panel::<MotePanel>() {
+                    Ok(panel) => configure_panel(&panel),
+                    Err(error) => {
+                        eprintln!("mote: could not create the overlay panel: {error}");
+                    }
+                }
 
                 #[cfg(debug_assertions)]
                 {
