@@ -769,6 +769,10 @@ export function mountApp() {
     shell.classList.add("is-popping");
   }
 
+  shell.addEventListener("animationend", (event) => {
+    if (event.animationName === "shell-pop") shell.classList.remove("is-popping");
+  });
+
   pick<HTMLButtonElement>("#new-note").addEventListener("click", () => addNote());
   pick<HTMLButtonElement>("#pin-note").addEventListener("click", () => togglePinActive());
   pick<HTMLButtonElement>("#open-palette").addEventListener("click", () => openPalette());

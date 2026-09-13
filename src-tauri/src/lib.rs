@@ -1,7 +1,7 @@
 mod shake;
 mod window_state;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -34,9 +34,15 @@ static HIDE_ON_BLUR: AtomicBool = AtomicBool::new(true);
 static HAS_SHOWN: AtomicBool = AtomicBool::new(false);
 static FOCUSED_SINCE_REVEAL: AtomicBool = AtomicBool::new(false);
 static LAST_REVEAL: Mutex<Option<Instant>> = Mutex::new(None);
+static LAST_FOCUS: Mutex<Option<Instant>> = Mutex::new(None);
+/// Bumped whenever the panel is revealed or focused so a blur that was queued
+/// before the new focus state can no longer hide the panel.
+static HIDE_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 /// Blur events fired right after a reveal are spurious while AppKit settles focus.
 const BLUR_GRACE: Duration = Duration::from_millis(450);
+/// Delay before acting on a blur so focus can bounce back without a flicker.
+const BLUR_SETTLE: Duration = Duration::from_millis(120);
 
 const PIN_WIDTH: f64 = 280.0;
 const PIN_HEIGHT: f64 = 240.0;
@@ -204,6 +210,8 @@ pub(crate) fn reveal(app: &AppHandle) {
         return;
     };
     FOCUSED_SINCE_REVEAL.store(false, Ordering::Relaxed);
+    // Any blur that was queued before this reveal must not hide the panel.
+    HIDE_TOKEN.fetch_add(1, Ordering::SeqCst);
     #[cfg(not(target_os = "macos"))]
     {
         let _ = window.set_visible_on_all_workspaces(true);
@@ -275,6 +283,14 @@ fn conceal(app: &AppHandle) {
 
 fn revealed_recently() -> bool {
     LAST_REVEAL
+        .lock()
+        .ok()
+        .and_then(|last| *last)
+        .is_some_and(|instant| instant.elapsed() < BLUR_GRACE)
+}
+
+fn focused_recently() -> bool {
+    LAST_FOCUS
         .lock()
         .ok()
         .and_then(|last| *last)
@@ -523,6 +539,17 @@ pub fn run() {
     ));
     #[cfg(target_os = "macos")]
     let builder = builder.plugin(tauri_nspanel::init());
+    // macOS can terminate the web content process while Mote sits hidden (App
+    // Nap, memory pressure). Without this the overlay comes back blank until
+    // the app is restarted; notes live in localStorage so a reload is lossless.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let builder = builder.on_web_content_process_terminate(|webview| {
+        let webview = webview.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = webview.reload();
+        });
+    });
 
     builder
         .invoke_handler(tauri::generate_handler![
@@ -588,6 +615,11 @@ pub fn run() {
             WindowEvent::Focused(true) => {
                 if window.label() == "main" {
                     FOCUSED_SINCE_REVEAL.store(true, Ordering::Relaxed);
+                    if let Ok(mut last) = LAST_FOCUS.lock() {
+                        *last = Some(Instant::now());
+                    }
+                    // A focus event invalidates any blur still waiting to hide.
+                    HIDE_TOKEN.fetch_add(1, Ordering::SeqCst);
                 }
             }
             WindowEvent::Focused(false)
@@ -597,7 +629,23 @@ pub fn run() {
                     && FOCUSED_SINCE_REVEAL.load(Ordering::Relaxed)
                     && !revealed_recently() =>
             {
-                let _ = window.hide();
+                // AppKit can deliver a blur from an earlier focus cycle right
+                // after the panel was revealed. Settle briefly and re-check
+                // before hiding so the overlay cannot blank itself out.
+                let token = HIDE_TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
+                let app = window.app_handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(BLUR_SETTLE);
+                    if HIDE_TOKEN.load(Ordering::SeqCst) != token || focused_recently() {
+                        return;
+                    }
+                    if let Some(window) = app.get_webview_window("main") {
+                        if window.is_focused().unwrap_or(false) {
+                            return;
+                        }
+                        hide_main(&window);
+                    }
+                });
             }
             _ => {}
         })
