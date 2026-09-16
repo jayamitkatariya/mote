@@ -29,13 +29,23 @@ window juggling, no accounts. Every note stays on your Mac.
 - **Global shortcut** — `⌥M` shows or hides Mote from any app, including
   native full-screen apps.
 - **Pinned stickies** — pin a note and it becomes an always-on-top sticky that
-  stays visible across Spaces and over full-screen apps.
-- **Command palette** — `⌘K` searches every note with fuzzy matching and runs
-  app commands (new note, pin, export, trash, quit).
+  stays visible across Spaces and over full-screen apps. Stickies remember
+  their position and size, can be tinted, and support undo.
+- **Command palette** — `⌘K` searches every note with fuzzy matching, filters
+  by `#tag`, and runs app commands (new note, pin, duplicate, export, trash,
+  quit).
+- **Tags & colors** — any `#tag` you type is indexed for search, and notes can
+  be tinted from the titlebar swatch.
+- **Image attachments** — drag images straight onto Mote; they are stored,
+  thumbnailed, and shown in a tray under the note.
 - **Tabs & trash** — keep several notes open; closing one moves it to the trash
   where it can be restored or deleted forever.
 - **Undo/redo** — per-note history with coalesced typing steps.
-- **Autosave** — notes persist locally the moment you type.
+- **Durable storage** — notes live in a plain JSON document on disk, written
+  atomically with rotating backups. One-time migration preserves notes from
+  older builds.
+- **Export/import** — copy notes as JSON, export a JSON file or a folder of
+  Markdown files, and import notes from a JSON export.
 - **Open at login** — optional launch agent, toggleable from Settings or the
   menu bar.
 - **Hide when inactive** — optionally dismiss the overlay as soon as focus
@@ -114,24 +124,37 @@ with no frontend framework.
   without stealing focus or switching Spaces. The panel is clipped to the same
   corner radius as the UI shell.
 - **Sticky notes** are separate always-on-top windows labelled `pin-<note-id>`
-  that sync their body with the main window over Tauri events.
-- **Storage** is the webview's `localStorage`; window size is persisted to
-  `~/Library/Application Support/com.jaykatariya.mote/window.json`.
+  that sync their body, color, opacity, and attachment count with the main
+  window over Tauri events. Their geometry is remembered per note.
+- **Storage** is a JSON document (`doc.json`) in
+  `~/Library/Application Support/com.jaykatariya.mote/`, written atomically with
+  a rotating set of backups in `backups/`. Images are content-addressed under
+  `attachments/`. Window size is persisted alongside it, per-sticky geometry in
+  `pins.json`.
+- **Migration** — on first launch after upgrading, notes found in the old
+  `localStorage` key are archived to `backups/legacy-localstorage-*.json`,
+  upgraded in memory, written to `doc.json`, and the legacy key is left
+  untouched as a fallback.
 
 ## Project structure
 
 ```text
 src/                     Frontend (vanilla TypeScript)
-  app.ts                 Main window UI, palette, settings, trash
+  app.ts                 Main window UI, palette, settings, trash, attachments
   sticky.ts              Pinned sticky window UI
-  store.ts               Note document, persistence, schema validation
+  store.ts               Note document, schema validation, migration, persistence
   search.ts              Fuzzy matching, snippets, highlighting
+  tags.ts                Hashtag parsing and indexing
+  colors.ts              Note color palette
   history.ts             Per-note undo/redo stack
   tauri.ts               Typed wrapper around the Rust commands/events
 src-tauri/               Rust backend
   src/lib.rs             Windows, tray, global shortcut, pins, IPC commands
   src/shake.rs           Cursor shake detection
   src/window_state.rs    Window size persistence
+  src/pin_state.rs       Per-sticky geometry persistence
+  src/doc_store.rs       Atomic document writes, backups, export/import
+  src/attachments.rs     Content-addressed image storage and thumbnails
   capabilities/          Tauri permission capabilities
 ```
 
@@ -145,8 +168,8 @@ cd src-tauri && cargo clippy     # lints
 
 ## Privacy
 
-Mote never talks to the network. Notes, settings, and window state are stored
-locally on your Mac and nowhere else.
+Mote never talks to the network. Notes, settings, images, and window state are
+stored locally on your Mac and nowhere else.
 
 ## Contributing
 

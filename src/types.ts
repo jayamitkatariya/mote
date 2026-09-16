@@ -1,3 +1,13 @@
+export type NoteColor = "yellow" | "orange" | "pink" | "purple" | "blue" | "green" | "gray";
+
+export interface Attachment {
+  id: string;
+  name: string;
+  ext: string;
+  size: number;
+  createdAt: number;
+}
+
 export interface Note {
   id: string;
   title: string;
@@ -5,6 +15,9 @@ export interface Note {
   createdAt: number;
   updatedAt: number;
   closedAt?: number;
+  color?: NoteColor;
+  tags: string[];
+  attachments: Attachment[];
 }
 
 export interface Settings {
@@ -12,10 +25,11 @@ export interface Settings {
   shakeSensitivity: number;
   hideOnBlur: boolean;
   pinnedIds: string[];
+  stickyOpacity: number;
 }
 
 export interface Doc {
-  version: 1;
+  version: 2;
   notes: Note[];
   tabOrder: string[];
   activeId: string | null;

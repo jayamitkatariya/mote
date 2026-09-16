@@ -1,3 +1,6 @@
+mod attachments;
+mod doc_store;
+mod pin_state;
 mod shake;
 mod window_state;
 
@@ -111,11 +114,19 @@ fn pin_note(app: AppHandle, id: String, title: String) -> Result<(), String> {
         .keys()
         .filter(|key| key.starts_with("pin-"))
         .count();
-    let (x, y) = cascade_position(&app, index);
+
+    let stored = pin_state::get(&id).filter(|rect| pin_state::on_screen(&app, rect));
+    let (x, y, width, height) = match stored {
+        Some(rect) => (rect.x, rect.y, rect.width, rect.height),
+        None => {
+            let (x, y) = cascade_position(&app, index);
+            (x, y, PIN_WIDTH, PIN_HEIGHT)
+        }
+    };
 
     let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("sticky.html".into()))
         .title(&title)
-        .inner_size(PIN_WIDTH, PIN_HEIGHT)
+        .inner_size(width, height)
         .min_inner_size(180.0, 120.0)
         .decorations(false)
         .transparent(true)
@@ -144,6 +155,81 @@ fn unpin_note(app: AppHandle, id: String) {
     if let Some(window) = app.get_webview_window(&format!("pin-{id}")) {
         let _ = window.close();
     }
+}
+
+#[tauri::command]
+fn forget_pin(app: AppHandle, id: String) {
+    pin_state::forget(&app, &id);
+}
+
+#[tauri::command]
+fn load_doc(app: AppHandle) -> Result<Option<serde_json::Value>, String> {
+    doc_store::load(&app)
+}
+
+#[tauri::command]
+fn save_doc(app: AppHandle, doc: serde_json::Value) -> Result<(), String> {
+    doc_store::save(&app, &doc)
+}
+
+#[tauri::command]
+fn get_note(app: AppHandle, id: String) -> Result<Option<serde_json::Value>, String> {
+    doc_store::get_note(&app, &id)
+}
+
+#[tauri::command]
+fn save_legacy_snapshot(app: AppHandle, contents: String) -> Result<String, String> {
+    doc_store::save_legacy_snapshot(&app, &contents)
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    doc_store::write_text_file(&path, &contents)
+}
+
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    doc_store::read_text_file(&path)
+}
+
+#[tauri::command]
+fn export_markdown_dir(dir: String, files: Vec<doc_store::MarkdownFile>) -> Result<usize, String> {
+    doc_store::export_markdown_files(&dir, &files)
+}
+
+#[tauri::command]
+fn open_data_dir(app: AppHandle) -> Result<(), String> {
+    let dir = doc_store::data_dir(&app)?;
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    doc_store::open_dir(&dir)
+}
+
+#[tauri::command]
+fn import_attachment(
+    app: AppHandle,
+    path: String,
+) -> Result<attachments::ImportedAttachment, String> {
+    attachments::import(&app, &path)
+}
+
+#[tauri::command]
+fn resolve_attachment(
+    app: AppHandle,
+    id: String,
+    ext: String,
+) -> Result<attachments::ResolvedAttachment, String> {
+    attachments::resolve(&app, &id, &ext)
+}
+
+#[tauri::command]
+fn reveal_attachment(app: AppHandle, id: String, ext: String) -> Result<(), String> {
+    attachments::reveal(&app, &id, &ext)
+}
+
+#[tauri::command]
+fn prune_attachments(app: AppHandle, keep: Vec<String>) -> Result<usize, String> {
+    attachments::prune(&app, &keep)
 }
 
 fn cascade_position(app: &AppHandle, index: usize) -> (f64, f64) {
@@ -533,15 +619,17 @@ fn register_shortcut(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_autostart::init(
-        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-        None,
-    ));
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_dialog::init());
     #[cfg(target_os = "macos")]
     let builder = builder.plugin(tauri_nspanel::init());
     // macOS can terminate the web content process while Mote sits hidden (App
     // Nap, memory pressure). Without this the overlay comes back blank until
-    // the app is restarted; notes live in localStorage so a reload is lossless.
+    // the app is restarted; notes live in doc.json so a reload is lossless.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let builder = builder.on_web_content_process_terminate(|webview| {
         let webview = webview.clone();
@@ -564,7 +652,20 @@ pub fn run() {
             set_autostart,
             set_pointer_down,
             pin_note,
-            unpin_note
+            unpin_note,
+            forget_pin,
+            load_doc,
+            save_doc,
+            get_note,
+            save_legacy_snapshot,
+            write_text_file,
+            read_text_file,
+            export_markdown_dir,
+            open_data_dir,
+            import_attachment,
+            resolve_attachment,
+            reveal_attachment,
+            prune_attachments
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -576,6 +677,8 @@ pub fn run() {
             }
             shake::start(app.handle().clone());
             window_state::start(app.handle().clone());
+            doc_store::backup_on_launch(app.handle());
+            pin_state::start(app.handle().clone());
 
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
@@ -603,6 +706,13 @@ pub fn run() {
             WindowEvent::Resized(_) => {
                 if window.label() == "main" {
                     window_state::remember(window);
+                } else if window.label().starts_with("pin-") {
+                    pin_state::remember(window);
+                }
+            }
+            WindowEvent::Moved(_) => {
+                if window.label().starts_with("pin-") {
+                    pin_state::remember(window);
                 }
             }
             WindowEvent::Destroyed => {
@@ -654,6 +764,7 @@ pub fn run() {
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 window_state::flush(app);
+                pin_state::flush(app);
             }
         });
 }

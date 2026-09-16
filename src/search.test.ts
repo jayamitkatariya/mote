@@ -3,7 +3,7 @@ import { fuzzyMatch, highlight, searchNotes } from "./search";
 import type { Note } from "./types";
 
 function note(id: string, title: string, body: string, updatedAt = 1): Note {
-  return { id, title, body, createdAt: updatedAt, updatedAt };
+  return { id, title, body, createdAt: updatedAt, updatedAt, tags: [], attachments: [] };
 }
 
 describe("fuzzyMatch", () => {

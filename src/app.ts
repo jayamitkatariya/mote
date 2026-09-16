@@ -1,15 +1,19 @@
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { NOTE_COLORS, swatchFor } from "./colors";
 import { History, type Snapshot } from "./history";
 import { escapeHtml, fuzzyMatch, highlight, searchNotes } from "./search";
 import { Store } from "./store";
-import { api } from "./tauri";
+import { allTags } from "./tags";
+import { api, type DocChangedPayload, type ResolvedAttachment } from "./tauri";
+import type { Attachment, Note, NoteColor } from "./types";
 
 interface ViewState {
   start: number;
   end: number;
   scrollTop: number;
 }
-
-export const store = new Store();
 
 interface PaletteItem {
   kind: "note" | "action";
@@ -22,6 +26,8 @@ interface PaletteItem {
   action?: () => void;
 }
 
+const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"]);
+
 const icons = {
   plus: `<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 3.4v9.2M3.4 8h9.2"/></svg>`,
   search: `<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="7" cy="7" r="4.2"/><path d="M10.2 10.2 13.4 13.4"/></svg>`,
@@ -32,6 +38,8 @@ const icons = {
   bolt: `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8.6 2.2 4.4 8.8h3l-1 5 4.2-6.6h-3z"/></svg>`,
   restore: `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.4 6.4A5 5 0 1 1 3.1 8.8"/><path d="M3.2 3.4v3h3"/></svg>`,
   pin: `<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.3 2.4h3.4l-.6 3.4 2.2 2.2v.9H4.7v-.9l2.2-2.2z"/><path d="M8 8.9v4.7"/></svg>`,
+  tag: `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.9 8.1V3.3h4.8l5.4 5.4-4.8 4.8z"/><circle cx="5.5" cy="5.5" r="0.8"/></svg>`,
+  external: `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.4 3h3.6v3.6"/><path d="M13 3 7.8 8.2"/><path d="M12 9.6v2.4A1.6 1.6 0 0 1 10.4 13.6H4.6A1.6 1.6 0 0 1 3 12V6.2a1.6 1.6 0 0 1 1.6-1.6H7"/></svg>`,
 };
 
 function pick<T extends Element>(selector: string): T {
@@ -52,7 +60,22 @@ function relativeTime(timestamp: number): string {
   return new Date(timestamp).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-export function mountApp() {
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fileStem(title: string, id: string): string {
+  const cleaned = title
+    .replace(/[\\/:*?"<>|#]+/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 48);
+  return `${cleaned || "untitled"}-${id.slice(0, 6)}`;
+}
+
+export function mountApp(store: Store) {
   const root = pick<HTMLDivElement>("#app");
 
   root.innerHTML = `
@@ -61,13 +84,23 @@ export function mountApp() {
         <div class="tabs" id="tabs" role="tablist"></div>
         <button class="icon-button" id="new-note" title="New note (⌘N)">${icons.plus}</button>
         <div class="drag-space" data-tauri-drag-region></div>
+        <button class="icon-button color-button" id="note-color" title="Note color"><span class="color-dot" id="color-dot"></span></button>
         <button class="icon-button" id="pin-note" title="Pin note (⌘⇧P)">${icons.pin}</button>
         <button class="icon-button" id="open-palette" title="Search (⌘K)">${icons.search}</button>
         <button class="icon-button" id="open-settings" title="Settings (⌘,)">${icons.sliders}</button>
       </header>
-      <main class="editor-area">
+      <div class="color-popover" id="color-popover" hidden></div>
+      <main class="editor-area" id="editor-area">
         <textarea id="editor" class="editor" placeholder="start typing…" spellcheck="true" autocomplete="off"></textarea>
+        <div class="drop-hint" id="drop-hint" hidden>drop images to attach</div>
       </main>
+      <div class="attachment-tray" id="attachment-tray" hidden>
+        <div class="attachment-head">
+          <span class="attachment-label">attachments</span>
+          <span class="attachment-count" id="attachment-count"></span>
+        </div>
+        <div class="attachment-thumbs" id="attachment-thumbs"></div>
+      </div>
       <footer class="statusbar">
         <div class="status-group">
           <span id="word-count">0 words</span>
@@ -80,7 +113,7 @@ export function mountApp() {
       </footer>
       <div class="overlay" id="palette-overlay" hidden>
         <div class="palette-panel">
-          <input id="palette-input" class="palette-input" type="text" placeholder="search notes or run a command…" spellcheck="false" autocomplete="off" />
+          <input id="palette-input" class="palette-input" type="text" placeholder="search notes, #tags, or run a command…" spellcheck="false" autocomplete="off" />
           <div class="palette-list" id="palette-list"></div>
           <div class="palette-foot"><span>↑↓ navigate</span><span>↵ open</span><span>esc dismiss</span></div>
         </div>
@@ -114,6 +147,13 @@ export function mountApp() {
               </div>
               <label class="switch"><input type="checkbox" id="set-blur" /><span class="track"></span></label>
             </div>
+            <div class="setting-row setting-row-column">
+              <div class="setting-copy">
+                <span class="setting-title">sticky opacity</span>
+                <span class="setting-desc">how solid pinned notes look</span>
+              </div>
+              <input type="range" id="set-opacity" min="0.35" max="1" step="0.01" />
+            </div>
             <div class="setting-row">
               <div class="setting-copy">
                 <span class="setting-title">open at login</span>
@@ -132,6 +172,13 @@ export function mountApp() {
             </div>
             <div class="setting-row">
               <div class="setting-copy">
+                <span class="setting-title">data folder</span>
+                <span class="setting-desc">notes, backups, attachments</span>
+              </div>
+              <button class="text-button" id="open-data">open</button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-copy">
                 <span class="setting-title">trash</span>
                 <span class="setting-desc" id="trash-desc">no closed notes</span>
               </div>
@@ -139,8 +186,11 @@ export function mountApp() {
             </div>
           </div>
           </div>
-          <div class="settings-actions">
-            <button class="text-button" id="export-notes">copy notes as json</button>
+          <div class="settings-actions settings-actions-wrap">
+            <button class="text-button" id="copy-notes">copy notes as json</button>
+            <button class="text-button" id="export-json">export json…</button>
+            <button class="text-button" id="export-markdown">export markdown…</button>
+            <button class="text-button" id="import-notes">import…</button>
             <button class="text-button danger" id="quit-app">quit mote</button>
           </div>
         </div>
@@ -158,18 +208,32 @@ export function mountApp() {
           </div>
         </div>
       </div>
+      <div class="overlay lightbox" id="lightbox-overlay" hidden>
+        <figure class="lightbox-figure">
+          <img id="lightbox-image" alt="" />
+          <figcaption id="lightbox-caption"></figcaption>
+        </figure>
+      </div>
       <div class="toast" id="toast" hidden></div>
     </div>
   `;
 
   const shell = pick<HTMLDivElement>("#shell");
   const tabsEl = pick<HTMLDivElement>("#tabs");
+  const editorAreaEl = pick<HTMLElement>("#editor-area");
   const editorEl = pick<HTMLTextAreaElement>("#editor");
+  const dropHintEl = pick<HTMLDivElement>("#drop-hint");
+  const colorButtonEl = pick<HTMLButtonElement>("#note-color");
+  const colorDotEl = pick<HTMLSpanElement>("#color-dot");
+  const colorPopover = pick<HTMLDivElement>("#color-popover");
   const pinButtonEl = pick<HTMLButtonElement>("#pin-note");
   const wordCountEl = pick<HTMLSpanElement>("#word-count");
   const noteCountEl = pick<HTMLSpanElement>("#note-count");
   const saveDotEl = pick<HTMLSpanElement>("#save-dot");
   const saveLabelEl = pick<HTMLSpanElement>("#save-label");
+  const trayEl = pick<HTMLDivElement>("#attachment-tray");
+  const trayThumbsEl = pick<HTMLDivElement>("#attachment-thumbs");
+  const trayCountEl = pick<HTMLSpanElement>("#attachment-count");
   const paletteOverlay = pick<HTMLDivElement>("#palette-overlay");
   const paletteInput = pick<HTMLInputElement>("#palette-input");
   const paletteList = pick<HTMLDivElement>("#palette-list");
@@ -179,10 +243,14 @@ export function mountApp() {
   const trashCountEl = pick<HTMLSpanElement>("#trash-count");
   const trashDescEl = pick<HTMLSpanElement>("#trash-desc");
   const emptyTrashEl = pick<HTMLButtonElement>("#empty-trash");
+  const lightboxOverlay = pick<HTMLDivElement>("#lightbox-overlay");
+  const lightboxImage = pick<HTMLImageElement>("#lightbox-image");
+  const lightboxCaption = pick<HTMLSpanElement>("#lightbox-caption");
   const toastEl = pick<HTMLDivElement>("#toast");
   const setShakeEl = pick<HTMLInputElement>("#set-shake");
   const setSensitivityEl = pick<HTMLInputElement>("#set-sensitivity");
   const setBlurEl = pick<HTMLInputElement>("#set-blur");
+  const setOpacityEl = pick<HTMLInputElement>("#set-opacity");
   const setAutostartEl = pick<HTMLInputElement>("#set-autostart");
 
   let paletteOpen = false;
@@ -191,14 +259,29 @@ export function mountApp() {
   let paletteItems: PaletteItem[] = [];
   let settingsOpen = false;
   let trashOpen = false;
+  let colorPopoverOpen = false;
+  let lightboxOpen = false;
   let toastTimer: number | undefined;
   let toastHideTimer: number | undefined;
   let saveTimer: number | undefined;
   let stickySyncTimer: number | undefined;
+  let lastTrayKey = "";
   const pendingStickyIds = new Set<string>();
   const history = new History();
   const viewStates = new Map<string, ViewState>();
   const confirmTimers = new WeakMap<HTMLButtonElement, number>();
+  const attachmentPaths = new Map<string, ResolvedAttachment>();
+
+  function docChangedPayload(note: Note): DocChangedPayload {
+    return {
+      id: note.id,
+      title: note.title,
+      body: note.body,
+      color: note.color,
+      opacity: store.doc.settings.stickyOpacity,
+      attachmentCount: note.attachments.length,
+    };
+  }
 
   function renderTabs() {
     tabsEl.innerHTML = "";
@@ -209,6 +292,14 @@ export function mountApp() {
       tab.dataset.id = note.id;
       tab.tabIndex = -1;
       tab.title = note.title || "Untitled";
+
+      const swatch = swatchFor(note.color);
+      if (swatch) {
+        const dot = document.createElement("span");
+        dot.className = "tab-color";
+        dot.style.background = swatch.hex;
+        tab.append(dot);
+      }
 
       const title = document.createElement("span");
       title.className = "tab-title";
@@ -244,6 +335,8 @@ export function mountApp() {
     }
     renderStatus();
     refreshPinButton();
+    refreshColorButton();
+    renderTray();
   }
 
   function renderStatus() {
@@ -325,14 +418,23 @@ export function mountApp() {
 
   function markSaved() {
     saveDotEl.classList.remove("is-saving");
+    saveDotEl.classList.remove("is-error");
     saveLabelEl.textContent = "saved";
   }
 
   function markSaving() {
     saveDotEl.classList.add("is-saving");
+    saveDotEl.classList.remove("is-error");
     saveLabelEl.textContent = "saving…";
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = window.setTimeout(markSaved, 420);
+  }
+
+  function markSaveError() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveDotEl.classList.remove("is-saving");
+    saveDotEl.classList.add("is-error");
+    saveLabelEl.textContent = "save failed";
   }
 
   function selectNote(id: string) {
@@ -376,6 +478,12 @@ export function mountApp() {
     pinButtonEl.title = pinned ? "Unpin note (⌘⇧P)" : "Pin note (⌘⇧P)";
   }
 
+  function refreshColorButton() {
+    const swatch = swatchFor(store.active()?.color);
+    colorDotEl.style.background = swatch?.hex ?? "transparent";
+    colorButtonEl.classList.toggle("is-active", Boolean(swatch));
+  }
+
   function togglePinActive() {
     const active = store.active();
     if (!active || active.closedAt) return;
@@ -403,9 +511,9 @@ export function mountApp() {
       const ids = [...pendingStickyIds];
       pendingStickyIds.clear();
       for (const id of ids) {
-        const note = store.doc.notes.find((value) => value.id === id);
+        const note = store.find(id);
         if (!note || note.closedAt) continue;
-        void api.emitDocChanged({ id: note.id, title: note.title, body: note.body });
+        void api.emitDocChanged(docChangedPayload(note));
       }
     }, 120);
   }
@@ -433,6 +541,199 @@ export function mountApp() {
     }, 1900);
   }
 
+  function renderTray(force = false) {
+    const note = store.active();
+    const attachments = note?.attachments ?? [];
+    if (!note || attachments.length === 0) {
+      trayEl.hidden = true;
+      trayThumbsEl.innerHTML = "";
+      lastTrayKey = "";
+      return;
+    }
+    trayEl.hidden = false;
+    const count = attachments.length;
+    trayCountEl.textContent = `${count} ${count === 1 ? "image" : "images"}`;
+    const key = `${note.id}:${attachments.map((value) => value.id).join(",")}`;
+    if (!force && key === lastTrayKey) return;
+    lastTrayKey = key;
+    trayThumbsEl.innerHTML = "";
+
+    for (const attachment of attachments) {
+      const figure = document.createElement("figure");
+      figure.className = "attachment-thumb";
+      figure.title = `${attachment.name} · ${formatBytes(attachment.size)}`;
+
+      const image = document.createElement("img");
+      image.alt = attachment.name;
+      image.loading = "lazy";
+      image.dataset.attachment = attachment.id;
+
+      const remove = document.createElement("button");
+      remove.className = "attachment-remove";
+      remove.title = "Remove image";
+      remove.innerHTML = icons.close;
+      remove.addEventListener("click", (event) => {
+        event.stopPropagation();
+        removeAttachment(attachment);
+      });
+
+      const reveal = document.createElement("button");
+      reveal.className = "attachment-reveal";
+      reveal.title = "Reveal in Finder";
+      reveal.innerHTML = icons.external;
+      reveal.addEventListener("click", (event) => {
+        event.stopPropagation();
+        void api.revealAttachment(attachment.id, attachment.ext).catch(() => {
+          showToast("could not reveal that file");
+        });
+      });
+
+      figure.append(image, remove, reveal);
+      figure.addEventListener("click", () => {
+        void openLightbox(attachment);
+      });
+      trayThumbsEl.append(figure);
+      void hydrateThumb(image, attachment);
+    }
+  }
+
+  async function resolveAttachment(attachment: Attachment): Promise<ResolvedAttachment | null> {
+    const key = `${attachment.id}.${attachment.ext}`;
+    const cached = attachmentPaths.get(key);
+    if (cached) return cached;
+    try {
+      const resolved = await api.resolveAttachment(attachment.id, attachment.ext);
+      attachmentPaths.set(key, resolved);
+      return resolved;
+    } catch {
+      return null;
+    }
+  }
+
+  async function hydrateThumb(image: HTMLImageElement, attachment: Attachment) {
+    const resolved = await resolveAttachment(attachment);
+    const source = resolved?.thumb ?? resolved?.path;
+    if (!source) return;
+    image.src = convertFileSrc(source);
+    image.classList.add("is-loaded");
+  }
+
+  async function openLightbox(attachment: Attachment) {
+    const resolved = await resolveAttachment(attachment);
+    const source = resolved?.path ?? resolved?.thumb;
+    if (!source) {
+      showToast("image file is missing");
+      return;
+    }
+    lightboxImage.src = convertFileSrc(source);
+    lightboxImage.alt = attachment.name;
+    lightboxCaption.textContent = `${attachment.name} · ${formatBytes(attachment.size)}`;
+    lightboxOverlay.hidden = false;
+    lightboxOpen = true;
+  }
+
+  function closeLightbox(focus = true) {
+    lightboxOpen = false;
+    lightboxOverlay.hidden = true;
+    lightboxImage.removeAttribute("src");
+    if (focus) focusEditor();
+  }
+
+  function refreshAttachments() {
+    renderTray(true);
+    const active = store.active();
+    if (active) syncStickies(active.id);
+  }
+
+  async function handleDrop(paths: string[]) {
+    const active = store.active();
+    if (!active) return;
+    const images = paths.filter((path) => {
+      const ext = path.split(".").pop()?.toLowerCase() ?? "";
+      return IMAGE_EXTENSIONS.has(ext);
+    });
+    if (images.length === 0) {
+      showToast("only images can be attached");
+      return;
+    }
+    let added = 0;
+    for (const path of images) {
+      try {
+        const imported = await api.importAttachment(path);
+        attachmentPaths.set(`${imported.id}.${imported.ext}`, {
+          path: imported.path,
+          thumb: imported.thumb,
+        });
+        store.addAttachment(active.id, {
+          id: imported.id,
+          name: imported.name,
+          ext: imported.ext,
+          size: imported.size,
+          createdAt: Date.now(),
+        });
+        added += 1;
+      } catch (error) {
+        console.error("mote: could not attach image", error);
+      }
+    }
+    if (added === 0) {
+      showToast("could not attach those images");
+      return;
+    }
+    refreshAttachments();
+    renderTabs();
+    showToast(added === 1 ? "image attached" : `${added} images attached`);
+  }
+
+  function removeAttachment(attachment: Attachment) {
+    const active = store.active();
+    if (!active) return;
+    store.removeAttachment(active.id, attachment.id);
+    refreshAttachments();
+    void api.pruneAttachments(store.referencedAttachmentIds());
+    showToast("image removed");
+  }
+
+  function openColorPopover() {
+    const active = store.active();
+    colorPopover.innerHTML = "";
+    for (const swatch of NOTE_COLORS) {
+      const button = document.createElement("button");
+      button.className = `swatch${active?.color === swatch.id ? " is-active" : ""}`;
+      button.style.setProperty("--swatch", swatch.hex);
+      button.title = swatch.label;
+      button.addEventListener("click", () => setActiveColor(swatch.id));
+      colorPopover.append(button);
+    }
+    const none = document.createElement("button");
+    none.className = `swatch swatch-none${active?.color ? "" : " is-active"}`;
+    none.title = "no color";
+    none.addEventListener("click", () => setActiveColor(undefined));
+    colorPopover.append(none);
+
+    const buttonRect = colorButtonEl.getBoundingClientRect();
+    const shellRect = shell.getBoundingClientRect();
+    colorPopover.style.top = `${buttonRect.bottom - shellRect.top + 6}px`;
+    colorPopover.style.right = `${shellRect.right - buttonRect.right}px`;
+    colorPopover.hidden = false;
+    colorPopoverOpen = true;
+  }
+
+  function closeColorPopover() {
+    colorPopoverOpen = false;
+    colorPopover.hidden = true;
+  }
+
+  function setActiveColor(color: NoteColor | undefined) {
+    const active = store.active();
+    closeColorPopover();
+    if (!active) return;
+    store.setColor(active.id, color);
+    renderTabs();
+    refreshColorButton();
+    syncStickies(active.id);
+  }
+
   async function exportNotes() {
     const payload = JSON.stringify(
       { app: "mote", exportedAt: new Date().toISOString(), notes: store.doc.notes },
@@ -447,11 +748,94 @@ export function mountApp() {
     }
   }
 
+  function notesPayload(pretty = true): string {
+    return JSON.stringify(
+      { app: "mote", version: store.doc.version, exportedAt: new Date().toISOString(), notes: store.doc.notes },
+      null,
+      pretty ? 2 : undefined,
+    );
+  }
+
+  async function exportJsonFile() {
+    try {
+      const path = await save({
+        title: "Export notes",
+        defaultPath: `mote-notes-${new Date().toISOString().slice(0, 10)}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!path) return;
+      await api.writeTextFile(path, notesPayload());
+      showToast("notes exported as json");
+    } catch (error) {
+      console.error("mote: export failed", error);
+      showToast("could not export notes");
+    }
+  }
+
+  async function exportMarkdownFiles() {
+    try {
+      const dir = await open({ title: "Export notes as markdown", directory: true });
+      const target = Array.isArray(dir) ? dir[0] : dir;
+      if (!target) return;
+      const files = store.doc.notes.map((note) => ({
+        name: fileStem(note.title, note.id),
+        contents: note.body,
+      }));
+      const count = await api.exportMarkdownDir(target, files);
+      showToast(`exported ${count} markdown ${count === 1 ? "file" : "files"}`);
+    } catch (error) {
+      console.error("mote: markdown export failed", error);
+      showToast("could not export markdown");
+    }
+  }
+
+  async function importNotesFile() {
+    try {
+      const path = await open({
+        title: "Import notes",
+        multiple: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      const target = Array.isArray(path) ? path[0] : path;
+      if (!target) return;
+      const raw = await api.readTextFile(target);
+      const added = store.importNotes(JSON.parse(raw));
+      renderAll();
+      refreshTrashMeta();
+      showToast(added > 0 ? `imported ${added} ${added === 1 ? "note" : "notes"}` : "nothing new to import");
+    } catch (error) {
+      console.error("mote: import failed", error);
+      showToast("could not import that file");
+    }
+  }
+
   function paletteActions(): PaletteItem[] {
     const query = paletteQuery.trim();
     const items: PaletteItem[] = [];
+    const tagQuery = query.startsWith("#") ? query.slice(1).split(/\s+/)[0].toLowerCase() : null;
 
-    if (query) {
+    if (tagQuery !== null) {
+      const tags = allTags(store.doc.notes.map((note) => note.tags))
+        .filter((tag) => !tagQuery || tag.includes(tagQuery))
+        .slice(0, 5);
+      for (const tag of tags) {
+        items.push({
+          kind: "action",
+          id: `tag-${tag}`,
+          label: `filter #${tag}`,
+          detail: "tag",
+          action: () => {
+            paletteInput.value = `#${tag} `;
+            paletteQuery = paletteInput.value;
+            paletteIndex = 0;
+            renderPalette();
+            paletteInput.focus();
+          },
+        });
+      }
+    }
+
+    if (query && tagQuery === null) {
       items.push({
         kind: "action",
         id: "create",
@@ -462,7 +846,7 @@ export function mountApp() {
           addNote(query);
         },
       });
-    } else {
+    } else if (!query) {
       items.push({
         kind: "action",
         id: "new",
@@ -499,7 +883,33 @@ export function mountApp() {
           togglePinActive();
         },
       });
+      items.push({
+        kind: "action",
+        id: "duplicate",
+        label: "duplicate note",
+        action: () => {
+          closePalette(false);
+          const copy = store.duplicate(activeNote.id);
+          if (copy) {
+            renderAll();
+            focusEditor();
+            showToast("note duplicated");
+          }
+        },
+      });
     }
+
+    items.push({
+      kind: "action",
+      id: "sort",
+      label: "sort tabs by recent",
+      action: () => {
+        store.sortTabsByRecent();
+        renderTabs();
+        closePalette(false);
+        showToast("tabs sorted by most recent");
+      },
+    });
 
     items.push({
       kind: "action",
@@ -551,19 +961,30 @@ export function mountApp() {
 
   function buildPalette(): PaletteItem[] {
     const query = paletteQuery.trim();
-    const noteItems: PaletteItem[] = searchNotes(store.doc.notes, query).map((match) => ({
-      kind: "note",
-      id: match.note.id,
-      label: match.note.title,
-      detail: match.note.closedAt ? "closed" : relativeTime(match.note.updatedAt),
-      closed: Boolean(match.note.closedAt),
-      titleHtml: highlight(match.note.title, match.titleRanges),
-      snippetHtml: match.snippet ? highlight(match.snippet, match.snippetRanges) : "",
-      action: () => {
-        closePalette(false);
-        selectNote(match.note.id);
-      },
-    }));
+    let pool = store.doc.notes;
+    let search = query;
+    if (query.startsWith("#")) {
+      const [tag, ...rest] = query.slice(1).split(/\s+/);
+      if (tag) pool = pool.filter((note) => note.tags.includes(tag.toLowerCase()));
+      search = rest.join(" ");
+    }
+    const noteItems: PaletteItem[] = searchNotes(pool, search).map((match) => {
+      const tags = match.note.tags.slice(0, 2).map((tag) => `#${tag}`).join(" ");
+      const detail = match.note.closedAt ? "closed" : tags || relativeTime(match.note.updatedAt);
+      return {
+        kind: "note",
+        id: match.note.id,
+        label: match.note.title,
+        detail,
+        closed: Boolean(match.note.closedAt),
+        titleHtml: highlight(match.note.title, match.titleRanges),
+        snippetHtml: match.snippet ? highlight(match.snippet, match.snippetRanges) : "",
+        action: () => {
+          closePalette(false);
+          selectNote(match.note.id);
+        },
+      };
+    });
     const actions = paletteActions();
     if (query && noteItems.length === 0) return [...actions, ...noteItems];
     return [...noteItems, ...actions];
@@ -594,8 +1015,16 @@ export function mountApp() {
       const row = document.createElement("div");
       row.className = `palette-item${index === paletteIndex ? " is-active" : ""}${item.closed ? " is-closed" : ""}`;
       row.setAttribute("role", "option");
+      const icon =
+        item.kind === "note"
+          ? item.closed
+            ? icons.archive
+            : icons.note
+          : item.id.startsWith("tag-")
+            ? icons.tag
+            : icons.bolt;
       row.innerHTML = `
-        <span class="palette-icon">${item.kind === "note" ? (item.closed ? icons.archive : icons.note) : icons.bolt}</span>
+        <span class="palette-icon">${icon}</span>
         <span class="palette-copy">
           <span class="palette-title">${item.titleHtml ?? escapeHtml(item.label)}</span>
           ${item.snippetHtml ? `<span class="palette-snippet">${item.snippetHtml}</span>` : ""}
@@ -643,6 +1072,7 @@ export function mountApp() {
     setShakeEl.checked = store.doc.settings.shakeEnabled;
     setSensitivityEl.value = String(store.doc.settings.shakeSensitivity);
     setBlurEl.checked = store.doc.settings.hideOnBlur;
+    setOpacityEl.value = String(store.doc.settings.stickyOpacity);
     setAutostartEl.disabled = true;
     try {
       setAutostartEl.checked = await api.getAutostart();
@@ -739,6 +1169,8 @@ export function mountApp() {
         if (!armConfirm(remove, "sure?")) return;
         store.deleteForever(note.id);
         history.discard(note.id);
+        void api.forgetPin(note.id);
+        void api.pruneAttachments(store.referencedAttachmentIds());
         renderTrash();
         refreshTrashMeta();
         showToast("deleted forever");
@@ -773,6 +1205,11 @@ export function mountApp() {
     if (event.animationName === "shell-pop") shell.classList.remove("is-popping");
   });
 
+  colorButtonEl.addEventListener("click", () => {
+    if (colorPopoverOpen) closeColorPopover();
+    else openColorPopover();
+  });
+
   pick<HTMLButtonElement>("#new-note").addEventListener("click", () => addNote());
   pick<HTMLButtonElement>("#pin-note").addEventListener("click", () => togglePinActive());
   pick<HTMLButtonElement>("#open-palette").addEventListener("click", () => openPalette());
@@ -782,16 +1219,33 @@ export function mountApp() {
   pick<HTMLButtonElement>("#settings-close").addEventListener("click", () => closeSettings());
   pick<HTMLButtonElement>("#trash-close").addEventListener("click", () => closeTrash());
   pick<HTMLButtonElement>("#open-trash").addEventListener("click", () => openTrash());
+  pick<HTMLButtonElement>("#open-data").addEventListener("click", () => {
+    void api.openDataDir().catch(() => showToast("could not open the data folder"));
+  });
   emptyTrashEl.addEventListener("click", () => {
     if (!armConfirm(emptyTrashEl, "sure?")) return;
-    for (const note of store.trashed()) history.discard(note.id);
+    const removed = store.trashed().map((note) => note.id);
+    for (const id of removed) {
+      history.discard(id);
+      void api.forgetPin(id);
+    }
     store.emptyTrash();
+    void api.pruneAttachments(store.referencedAttachmentIds());
     renderTrash();
     refreshTrashMeta();
     showToast("trash emptied");
   });
-  pick<HTMLButtonElement>("#export-notes").addEventListener("click", () => {
+  pick<HTMLButtonElement>("#copy-notes").addEventListener("click", () => {
     void exportNotes();
+  });
+  pick<HTMLButtonElement>("#export-json").addEventListener("click", () => {
+    void exportJsonFile();
+  });
+  pick<HTMLButtonElement>("#export-markdown").addEventListener("click", () => {
+    void exportMarkdownFiles();
+  });
+  pick<HTMLButtonElement>("#import-notes").addEventListener("click", () => {
+    void importNotesFile();
   });
   pick<HTMLButtonElement>("#quit-app").addEventListener("click", () => {
     void api.quit();
@@ -805,6 +1259,16 @@ export function mountApp() {
   });
   trashOverlay.addEventListener("mousedown", (event) => {
     if (event.target === trashOverlay) closeTrash();
+  });
+  lightboxOverlay.addEventListener("mousedown", (event) => {
+    if (event.target === lightboxOverlay) closeLightbox();
+  });
+
+  document.addEventListener("pointerdown", (event) => {
+    if (!colorPopoverOpen) return;
+    const target = event.target as Node;
+    if (colorPopover.contains(target) || colorButtonEl.contains(target)) return;
+    closeColorPopover();
   });
 
   paletteInput.addEventListener("input", () => {
@@ -890,6 +1354,12 @@ export function mountApp() {
     void api.setHideOnBlur(next);
   });
 
+  setOpacityEl.addEventListener("input", () => {
+    const value = Number(setOpacityEl.value);
+    store.setSetting("stickyOpacity", value);
+    void api.emitSettingsChanged({ opacity: value });
+  });
+
   setAutostartEl.addEventListener("change", async () => {
     const next = setAutostartEl.checked;
     try {
@@ -906,6 +1376,15 @@ export function mountApp() {
 
     if (key === "escape") {
       event.preventDefault();
+      if (lightboxOpen) {
+        closeLightbox();
+        return;
+      }
+      if (colorPopoverOpen) {
+        closeColorPopover();
+        focusEditor();
+        return;
+      }
       if (trashOpen) {
         closeTrash();
         return;
@@ -918,7 +1397,7 @@ export function mountApp() {
         closePalette();
         return;
       }
-      store.flush();
+      void store.flush();
       void api.hide();
       return;
     }
@@ -981,8 +1460,7 @@ export function mountApp() {
       captureViewState(active.id);
       history.record(active.id, currentSnapshot(), { coalesceMs: 0 });
     }
-    store.flush();
-    markSaved();
+    void store.flush();
     void api.setPointerDown(false);
   });
 
@@ -997,8 +1475,29 @@ export function mountApp() {
   });
 
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) store.flush();
+    if (document.hidden) void store.flush();
   });
+
+  void getCurrentWebview().onDragDropEvent((event) => {
+    if (event.payload.type === "enter" || event.payload.type === "over") {
+      editorAreaEl.classList.add("is-dropping");
+      dropHintEl.hidden = false;
+    } else if (event.payload.type === "leave") {
+      editorAreaEl.classList.remove("is-dropping");
+      dropHintEl.hidden = true;
+    } else if (event.payload.type === "drop") {
+      editorAreaEl.classList.remove("is-dropping");
+      dropHintEl.hidden = true;
+      void handleDrop(event.payload.paths);
+    }
+  });
+
+  store.onPersisted = () => markSaved();
+  store.onPersistError = (error) => {
+    console.error("mote: could not save notes", error);
+    markSaveError();
+  };
+  if (store.lastError) markSaveError();
 
   void api.onShown(pulseShell);
   void api.onShake(pulseShell);
@@ -1007,7 +1506,7 @@ export function mountApp() {
   void api.setHideOnBlur(store.doc.settings.hideOnBlur);
 
   void api.onStickyEdit(({ id, body }) => {
-    const note = store.doc.notes.find((value) => value.id === id);
+    const note = store.find(id);
     if (!note || note.closedAt) {
       void api.unpinNote(id);
       return;
@@ -1023,12 +1522,12 @@ export function mountApp() {
   });
 
   void api.onStickyReady((id) => {
-    const note = store.doc.notes.find((value) => value.id === id);
+    const note = store.find(id);
     if (!note || note.closedAt) {
       void api.unpinNote(id);
       return;
     }
-    void api.emitDocChanged({ id, title: note.title, body: note.body });
+    void api.emitDocChanged(docChangedPayload(note));
   });
 
   void api.onPinClosed((id) => {
@@ -1037,7 +1536,7 @@ export function mountApp() {
   });
 
   for (const id of [...store.doc.settings.pinnedIds]) {
-    const note = store.doc.notes.find((value) => value.id === id);
+    const note = store.find(id);
     if (!note || note.closedAt) {
       store.unpin(id);
       continue;
